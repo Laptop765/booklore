@@ -55,25 +55,48 @@ public class LibraryProcessingService {
         notificationService.sendMessage(Topic.LOG, createLogNotification("Finished processing library: " + libraryEntity.getName()));
     }
 
-    @Transactional
+    @Transactional(timeout = 300) // 5 minute timeout
     public void rescanLibrary(long libraryId) throws IOException {
         LibraryEntity libraryEntity = libraryRepository.findById(libraryId).orElseThrow(() -> ApiError.LIBRARY_NOT_FOUND.createException(libraryId));
         notificationService.sendMessage(Topic.LOG, createLogNotification("Started refreshing library: " + libraryEntity.getName()));
-        LibraryFileProcessor processor = fileProcessorRegistry.getProcessor(libraryEntity);
-        List<LibraryFile> libraryFiles = getLibraryFiles(libraryEntity, processor);
-        List<Long> additionalFileIds = detectDeletedAdditionalFiles(libraryFiles, libraryEntity);
-        if (!additionalFileIds.isEmpty()) {
-            log.info("Detected {} removed additional files in library: {}", additionalFileIds.size(), libraryEntity.getName());
-            deleteRemovedAdditionalFiles(additionalFileIds);
+        
+        try {
+            LibraryFileProcessor processor = fileProcessorRegistry.getProcessor(libraryEntity);
+            List<LibraryFile> libraryFiles = getLibraryFiles(libraryEntity, processor);
+            
+            log.info("Found {} files in library: {}", libraryFiles.size(), libraryEntity.getName());
+            
+            // Process additional file deletions in batches
+            List<Long> additionalFileIds = detectDeletedAdditionalFiles(libraryFiles, libraryEntity);
+            if (!additionalFileIds.isEmpty()) {
+                log.info("Detected {} removed additional files in library: {}", additionalFileIds.size(), libraryEntity.getName());
+                deleteRemovedAdditionalFilesInBatches(additionalFileIds);
+            }
+            
+            // Process book deletions in batches
+            List<Long> bookIds = detectDeletedBookIds(libraryFiles, libraryEntity);
+            if (!bookIds.isEmpty()) {
+                log.info("Detected {} removed books in library: {}", bookIds.size(), libraryEntity.getName());
+                processDeletedLibraryFilesInBatches(bookIds, libraryFiles);
+            }
+            
+            // Restore deleted books
+            restoreDeletedBooks(libraryFiles);
+            
+            // Process new books in batches
+            List<LibraryFile> newFiles = detectNewBookPaths(libraryFiles, libraryEntity);
+            if (!newFiles.isEmpty()) {
+                log.info("Processing {} new files in library: {}", newFiles.size(), libraryEntity.getName());
+                processNewLibraryFilesInBatches(newFiles, libraryEntity, processor);
+            }
+            
+            notificationService.sendMessage(Topic.LOG, createLogNotification("Finished refreshing library: " + libraryEntity.getName()));
+            
+        } catch (Exception e) {
+            log.error("Error during library rescan for {}: {}", libraryEntity.getName(), e.getMessage(), e);
+            notificationService.sendMessage(Topic.LOG, createLogNotification("Error refreshing library " + libraryEntity.getName() + ": " + e.getMessage()));
+            throw e;
         }
-        List<Long> bookIds = detectDeletedBookIds(libraryFiles, libraryEntity);
-        if (!bookIds.isEmpty()) {
-            log.info("Detected {} removed books in library: {}", bookIds.size(), libraryEntity.getName());
-            processDeletedLibraryFiles(bookIds, libraryFiles);
-        }
-        restoreDeletedBooks(libraryFiles);
-        processor.processLibraryFiles(detectNewBookPaths(libraryFiles, libraryEntity), libraryEntity);
-        notificationService.sendMessage(Topic.LOG, createLogNotification("Finished refreshing library: " + libraryEntity.getName()));
     }
 
     private void restoreDeletedBooks(List<LibraryFile> libraryFiles) {
@@ -305,6 +328,60 @@ public class LibraryProcessingService {
                     .filter(Objects::nonNull)
                     .filter(file -> !file.getFileName().startsWith("."))
                     .toList();
+        }
+    }
+
+    /**
+     * Deletes additional files in batches to prevent database timeout
+     */
+    private void deleteRemovedAdditionalFilesInBatches(List<Long> additionalFileIds) {
+        final int BATCH_SIZE = 50;
+        for (int i = 0; i < additionalFileIds.size(); i += BATCH_SIZE) {
+            int end = Math.min(i + BATCH_SIZE, additionalFileIds.size());
+            List<Long> batch = additionalFileIds.subList(i, end);
+            log.debug("Deleting additional files batch {}/{}: {} files", 
+                (i / BATCH_SIZE + 1), 
+                (int) Math.ceil((double) additionalFileIds.size() / BATCH_SIZE), 
+                batch.size());
+            deleteRemovedAdditionalFiles(batch);
+        }
+    }
+
+    /**
+     * Processes deleted library files in batches to prevent database timeout
+     */
+    private void processDeletedLibraryFilesInBatches(List<Long> bookIds, List<LibraryFile> libraryFiles) {
+        final int BATCH_SIZE = 25; // Smaller batch for books due to more complex processing
+        for (int i = 0; i < bookIds.size(); i += BATCH_SIZE) {
+            int end = Math.min(i + BATCH_SIZE, bookIds.size());
+            List<Long> batch = bookIds.subList(i, end);
+            log.debug("Processing deleted books batch {}/{}: {} books", 
+                (i / BATCH_SIZE + 1), 
+                (int) Math.ceil((double) bookIds.size() / BATCH_SIZE), 
+                batch.size());
+            processDeletedLibraryFiles(batch, libraryFiles);
+        }
+    }
+
+    /**
+     * Processes new library files in batches to prevent database timeout
+     */
+    private void processNewLibraryFilesInBatches(List<LibraryFile> newFiles, LibraryEntity libraryEntity, LibraryFileProcessor processor) {
+        final int BATCH_SIZE = 20; // Conservative batch size for new file processing
+        for (int i = 0; i < newFiles.size(); i += BATCH_SIZE) {
+            int end = Math.min(i + BATCH_SIZE, newFiles.size());
+            List<LibraryFile> batch = newFiles.subList(i, end);
+            log.info("Processing new files batch {}/{}: {} files", 
+                (i / BATCH_SIZE + 1), 
+                (int) Math.ceil((double) newFiles.size() / BATCH_SIZE), 
+                batch.size());
+            
+            try {
+                processor.processLibraryFiles(batch, libraryEntity);
+            } catch (Exception e) {
+                log.error("Error processing new files batch: {}", e.getMessage(), e);
+                // Continue with next batch rather than failing entire operation
+            }
         }
     }
 }

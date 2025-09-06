@@ -68,6 +68,7 @@ public class BookDropService {
     private final MetadataRefreshService metadataRefreshService;
     private final BookdropNotificationService bookdropNotificationService;
     private final BookFileProcessorRegistry processorRegistry;
+    private final FileStabilityService fileStabilityService;
     private final AppProperties appProperties;
     private final BookdropFileMapper mapper;
     private final ObjectMapper objectMapper;
@@ -269,6 +270,13 @@ public class BookDropService {
             log.warn("Source file [id={}] not found at '{}'. Deleting entry from DB.", bookdropFile.getId(), source);
             bookdropNotificationService.sendBookdropFileSummaryNotification();
             return failureResult(targetFile.getName(), "Source file does not exist in bookdrop folder");
+        }
+
+        // Check if source file is stable and fully written before processing
+        if (!fileStabilityService.waitForFileStability(source, 30_000)) { // Wait up to 30 seconds
+            log.warn("Source file is not stable for processing: id={}, name={}, source={}", 
+                bookdropFile.getId(), bookdropFile.getFileName(), source);
+            return failureResult(targetFile.getName(), "Source file is still being written. Please wait and try again.");
         }
 
         if (targetFile.exists()) {

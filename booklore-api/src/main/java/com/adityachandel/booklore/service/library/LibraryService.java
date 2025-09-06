@@ -179,19 +179,35 @@ public class LibraryService {
         return libraryMapper.toLibrary(libraryEntity);
     }
 
+    /**
+     * Rescans a library with improved database transaction handling to prevent timeouts.
+     * Uses virtual threads and chunked processing for large libraries.
+     */
     public void rescanLibrary(long libraryId) {
+        log.info("Starting library rescan for library ID: {}", libraryId);
+        
+        // Verify library exists
         libraryRepository.findById(libraryId)
                 .orElseThrow(() -> ApiError.LIBRARY_NOT_FOUND.createException(libraryId));
-
+        
+        // Run the rescan in a virtual thread to avoid blocking the main thread
         SecurityContextVirtualThread.runWithSecurityContext(() -> {
             try {
                 libraryProcessingService.rescanLibrary(libraryId);
+                log.info("Completed library rescan for library ID: {}", libraryId);
             } catch (InvalidDataAccessApiUsageException e) {
-                log.debug("InvalidDataAccessApiUsageException - Library id: {}", libraryId);
+                log.error("Database timeout during library rescan for ID {}: {}", libraryId, e.getMessage());
+                notificationService.sendMessage(Topic.LOG, 
+                    "Library rescan for library " + libraryId + " failed due to database timeout. Please try again or contact administrator.");
             } catch (IOException e) {
-                log.error("Error while parsing library books", e);
+                log.error("IO error during library rescan for ID {}: {}", libraryId, e.getMessage());
+                notificationService.sendMessage(Topic.LOG, 
+                    "Library rescan for library " + libraryId + " failed due to file system error: " + e.getMessage());
+            } catch (Exception e) {
+                log.error("Unexpected error during library rescan for ID {}: {}", libraryId, e.getMessage(), e);
+                notificationService.sendMessage(Topic.LOG, 
+                    "Library rescan for library " + libraryId + " failed unexpectedly. Please check logs.");
             }
-            log.info("Parsing task completed!");
         });
     }
 
@@ -247,4 +263,5 @@ public class LibraryService {
         library.setFileNamingPattern(pattern);
         return libraryMapper.toLibrary(libraryRepository.save(library));
     }
+
 }
